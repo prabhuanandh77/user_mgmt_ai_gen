@@ -1,0 +1,139 @@
+# 1. KEYCLOAK DEPLOYMENT & SERVICE
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: keycloak
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: keycloak
+  template:
+    metadata:
+      labels:
+        app: keycloak
+    spec:
+      containers:
+      - name: keycloak
+        image: quay.io/keycloak/keycloak:24.0
+        args: ["start-dev"]
+        env:
+        - name: KEYCLOAK_ADMIN
+          value: "admin"
+        - name: KEYCLOAK_ADMIN_PASSWORD
+          value: "adminpassword"
+        - name: KC_PROXY
+          value: "edge"
+        - name: KC_HOSTNAME
+          #value: "keycloak.default.svc.cluster.local"
+          value: "keycloak.local"
+        ports:
+        - containerPort: 8080
+          name: http
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: keycloak
+  namespace: default
+spec:
+  ports:
+  - port: 8080
+    targetPort: 8080
+  selector:
+    app: keycloak
+---
+# 2. OAUTH2 PROXY DEPLOYMENT & SERVICE
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: oauth2-proxy
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: oauth2-proxy
+  template:
+    metadata:
+      labels:
+        app: oauth2-proxy
+    spec:
+      containers:
+      - name: oauth2-proxy
+        image: quay.io/oauth2-proxy/oauth2-proxy:v7.6.0
+        ports:
+        - containerPort: 4180
+          name: http
+        env:
+        - name: OAUTH2_PROXY_PROVIDER
+          value: "keycloak-oidc"
+        - name: OAUTH2_PROXY_CLIENT_ID
+          value: "frontend-client"
+        - name: OAUTH2_PROXY_CLIENT_SECRET
+          value: "my-super-secret-keycloak-token-123"
+        - name: OAUTH2_PROXY_COOKIE_SECRET
+          value: "2iHJl5Xicc4ROvhymTt6x4yphgENFCvnM3APkT0hPlQ=" # Ensure your generated 32-byte secret is pasted here
+        - name: OAUTH2_PROXY_OIDC_ISSUER_URL
+          value: "http://cluster.local"
+        - name: OAUTH2_PROXY_HTTP_ADDRESS
+          value: "0.0.0.0:4180"
+        - name: OAUTH2_PROXY_UPSTREAM
+          value: "file:///dev/null"
+        - name: OAUTH2_PROXY_INSECURE_OIDC_SKIP_ISSUER_TLS_VERIFY
+          value: "true"
+        - name: OAUTH2_PROXY_EMAIL_DOMAINS
+          value: "*"
+        # ADD THESE THREE LINES TO FORCE BYPASS DISCOVERY:
+        - name: OAUTH2_PROXY_SKIP_OIDC_DISCOVERY
+          value: "true"
+        - name: OAUTH2_PROXY_LOGIN_URL
+          value: "http://cluster.local/protocol/openid-connect/auth"
+        - name: OAUTH2_PROXY_REDEEM_URL
+          value: "http://cluster.local/protocol/openid-connect/token"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: oauth2-proxy
+  namespace: default
+spec:
+  ports:
+  - port: 4180
+    targetPort: 4180
+  selector:
+    app: oauth2-proxy
+---
+# 3. MAPPED INGRESS ROUTING
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: auth-ingress
+  namespace: default
+  annotations:
+    nginx.ingress.kubernetes.io/auth-url: "http://cluster.local"
+    nginx.ingress.kubernetes.io/auth-signin: "http://myapp.local"
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: myapp.local
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: frontend-service # UPDATED: Targets your existing service name
+            port:
+              number: 80           # Ensure this matches your frontend-service exposed port
+  - host: keycloak.local
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: keycloak
+            port:
+              number: 8080
