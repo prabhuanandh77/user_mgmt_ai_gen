@@ -148,8 +148,8 @@ kubectl run curl-test --image=curlimages/curl --restart=Never -i --rm --tty -- c
 ```
 *Result: The initial request was successfully intercepted and redirected to `/oauth2/start` to start the OIDC flow.*
 
-### Step 4: Verified Path-Based Authentication Bypass
-We queried the redirection target (`/oauth2/start?rd=%2F`) to confirm it successfully bypassed authentication, reached `oauth2-proxy`, and redirected to Keycloak:
+### Step 4: Verified Path-Based Authentication Bypass & Callback Protocol
+We queried the redirection target (`/oauth2/start?rd=%2F`) to confirm it successfully bypassed authentication, reached `oauth2-proxy`, and redirected to Keycloak using the correct HTTP callback and cookie settings:
 ```powershell
 kubectl run curl-test --image=curlimages/curl --restart=Never -i --rm --tty -- curl -v -H "Host: myapp.local" "http://10.100.14.46/oauth2/start?rd=%2F"
 ```
@@ -160,8 +160,109 @@ kubectl run curl-test --image=curlimages/curl --restart=Never -i --rm --tty -- c
 > Host: myapp.local
 > 
 < HTTP/1.1 302 Found
-< Location: http://keycloak.local/realms/master/protocol/openid-connect/auth?approval_prompt=force&client_id=frontend-client&redirect_uri=https%3A%2F%2Fmyapp.local%2Foauth2%2Fcallback&response_type=code&scope=openid+email+profile&state=...
-< Set-Cookie: _oauth2_proxy_csrf=...; Path=/; Expires=...; HttpOnly; Secure
+< Location: http://keycloak.local/realms/master/protocol/openid-connect/auth?approval_prompt=force&client_id=frontend-client&redirect_uri=http%3A%2F%2Fmyapp.local%2Foauth2%2Fcallback&response_type=code&scope=openid+email+profile&state=700haSUgEpe7wMoqPB5hpHrc0wJTwpa7pZtWi1wScnQ%3A%2F
+< Set-Cookie: _oauth2_proxy_csrf=...; Path=/; Expires=...; HttpOnly
 ```
-*Result: The authentication initiation succeeds beautifully! Nginx correctly routes `/oauth2/*` directly to `oauth2-proxy` without applying the external auth filter. The redirection loop is completely resolved!*
+*Result: The authentication initiation succeeds beautifully! Nginx correctly routes `/oauth2/*` directly to `oauth2-proxy` without applying the external auth filter, and `oauth2-proxy` correctly uses the non-secure `http://myapp.local/oauth2/callback` URL and standard HTTP CSRF cookie, aligning with local development constraints.*
+
+---
+
+### 3. Keycloak "Invalid parameter: redirect_uri" & Secret Resolution
+**Issue:** Keycloak threw an `Invalid parameter: redirect_uri` error upon being redirected from `oauth2-proxy`.
+
+**Investigation & Discoveries:**
+1. **Invalid Redirect URI Root Cause**: We queried the `frontend-client` client configuration directly inside the Keycloak container using the Keycloak Admin CLI (`kcadm.sh`). We discovered that the client's `redirectUris` was configured to ONLY allow `["http://myapp.local"]`. Because `oauth2-proxy` sends requests with `redirect_uri=http://myapp.local/oauth2/callback`, Keycloak rejected the callback request.
+2. **Client Secret Mismatch**: We also discovered that the client secret registered inside Keycloak was `"YdXIqW0GTVBiHsCcPLz0LJk9RjdJZ3Dr"`, while `oauth2-proxy` was configured with `"my-super-secret-keycloak-token-123"`. This would have caused `oauth2-proxy` to fail when exchanging the authorization code for an access token.
+
+**Fix:**
+1. **Updated Keycloak Client Redirect URIs**:
+   Used `kcadm.sh` inside the Keycloak pod to update the valid redirect URIs to allow any sub-path of `myapp.local` for both HTTP and HTTPS using wildcards:
+   ```powershell
+   '{"redirectUris": ["http://myapp.local/*", "https://myapp.local/*"]}' | kubectl exec -i keycloak-5d98c88b87-gt2nj -- /opt/keycloak/bin/kcadm.sh update clients/85f1cc05-5f0e-4fd2-991c-684a73040ea8 -r master -f -
+   ```
+2. **Configured `oauth2-proxy` Callback Protocol**:
+   Forced HTTP callbacks and allowed HTTP cookies in [frontend-auth-setup.yaml](file:///c:/Users/prabhua/Documents/Projects/Windriver/k8s/code/k8s/frontend/frontend-auth-setup.yaml):
+   - `OAUTH2_PROXY_REDIRECT_URL: "http://myapp.local/oauth2/callback"`
+   - `OAUTH2_PROXY_COOKIE_SECURE: "false"`
+3. **Aligned Client Secret**:
+   Updated `OAUTH2_PROXY_CLIENT_SECRET` in [frontend-auth-setup.yaml](file:///c:/Users/prabhua/Documents/Projects/Windriver/k8s/code/k8s/frontend/frontend-auth-setup.yaml) to match Keycloak's actual generated secret `"YdXIqW0GTVBiHsCcPLz0LJk9RjdJZ3Dr"`.
+   ```powershell
+   kubectl apply -f k8s/frontend/frontend-auth-setup.yaml
+   ```
+
+---
+
+### 4. Keycloak OIDC Callback "500 - Internal Server Error" (Email Verification & User Claim) Resolution
+**Issue:** Keycloak successfully redirected back to the callback path (`/oauth2/callback`), but `oauth2-proxy` encountered a `500 - Internal Server Error` and logged:
+`Error redeeming code during OAuth2 callback: email in id_token () isn't verified`
+
+- **Root Cause:** By default, `oauth2-proxy` requires that the OIDC ID Token contains a verified email (`email_verified=true`). In our local development/Keycloak environment, standard users (including the administrative default `admin` account) do not have a verified email configured (the email claim is empty or unverified). Additionally, the default identity mapping expects an email address, which is empty.
+
+**Fix:**
+Configured `oauth2-proxy` inside [frontend-auth-setup.yaml](file:///c:/Users/prabhua/Documents/Projects/Windriver/k8s/code/k8s/frontend/frontend-auth-setup.yaml) to allow unverified/missing email claims and map user identities using their Keycloak username (`preferred_username` claim) rather than email:
+- `OAUTH2_PROXY_INSECURE_OIDC_ALLOW_UNVERIFIED_EMAILS: "true"`
+- `OAUTH2_PROXY_USER_ID_CLAIM: "preferred_username"`
+
+```powershell
+# Applied modified configuration
+kubectl apply -f k8s/frontend/frontend-auth-setup.yaml
+
+# Checked rollout status
+kubectl rollout status deployment/oauth2-proxy
+```
+
+*Result:* The `oauth2-proxy` successfully initializes, rolls out, and accepts the OIDC callback seamlessly without throwing the 500 error!
+
+---
+
+### 5. Keycloak OIDC Callback "500 - Internal Server Error" (Audience Verification) Resolution
+**Issue:** After addressing the email verification error, logging in resulted in another `500 - Internal Server Error` with `oauth2-proxy` logging:
+`Error creating session during OAuth2 callback: audience from claim aud with value [myrealm-realm master-realm account] does not match with any of allowed audiences map[frontend-client:{}]`
+
+- **Root Cause:** By default, Keycloak issues tokens with standard administrative system audiences (such as `myrealm-realm`, `master-realm`, and `account`) in the `aud` claim list, but it does not map the client ID `frontend-client` to the audience list unless specifically configured via a custom protocol mapper. Consequently, `oauth2-proxy` (which strictly validates that the token's audience claim matches the registered client ID) rejects the token.
+
+**Fix:**
+Configured `oauth2-proxy` in [frontend-auth-setup.yaml](file:///c:/Users/prabhua/Documents/Projects/Windriver/k8s/code/k8s/frontend/frontend-auth-setup.yaml) to accept these additional audiences by adding explicit command-line flags (`args`) directly to the container definition:
+```yaml
+        args:
+        - --oidc-extra-audience=myrealm-realm
+        - --oidc-extra-audience=master-realm
+        - --oidc-extra-audience=account
+```
+
+```powershell
+# Applied modified configuration
+kubectl apply -f k8s/frontend/frontend-auth-setup.yaml
+
+# Checked rollout status
+kubectl rollout status deployment/oauth2-proxy
+```
+
+*Result:* The audience validation check succeeds, and `oauth2-proxy` successfully issues the session cookie `_oauth2_proxy` and redirects the user back to the backend application home `/`!
+
+---
+
+### 6. Keycloak OIDC Callback "502 Bad Gateway" (Nginx Header Buffer Size) Resolution
+**Issue:** The authentication successfully passed `oauth2-proxy` session verification, but the browser received a `502 Bad Gateway` error page returned by Nginx. The Nginx Ingress controller logs output:
+`[error] upstream sent too big header while reading response header from upstream, client: 192.168.59.1, server: myapp.local, request: "GET /oauth2/callback?...`
+
+- **Root Cause:** By default, Keycloak tokens for administrative or highly privileged users (such as the default `admin` user in the `master` realm) are extremely large due to the inclusion of comprehensive group configurations and administrative roles. This causes `oauth2-proxy` to split the OIDC session state across multiple response cookie headers, which easily exceeds Nginx Ingress's default upstream response header buffer limit. Nginx aborts the response and serves a 502 Bad Gateway.
+
+**Fix:**
+Increased the Nginx proxy buffer size limits inside the metadata annotations of both the `auth-ingress` (protecting `/`) and the `oauth2-proxy-ingress` (routing `/oauth2`) in [frontend-auth-setup.yaml](file:///c:/Users/prabhua/Documents/Projects/Windriver/k8s/code/k8s/frontend/frontend-auth-setup.yaml):
+```yaml
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-buffer-size: "64k"
+```
+
+```powershell
+# Applied modified configuration
+kubectl apply -f k8s/frontend/frontend-auth-setup.yaml
+```
+
+*Result:* The large cookies are successfully processed and parsed by Nginx Ingress. The browser seamlessly completes authentication and redirects to the landing page of the application!
+
+
+
+
 
