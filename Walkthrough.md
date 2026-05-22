@@ -262,7 +262,51 @@ kubectl apply -f k8s/frontend/frontend-auth-setup.yaml
 
 *Result:* The large cookies are successfully processed and parsed by Nginx Ingress. The browser seamlessly completes authentication and redirects to the landing page of the application!
 
+---
 
+### 7. Backend Container Stuck in Init State (Vault Reset) Resolution
+**Issue:** The backend container was stuck in the `Init:0/1` status. Pod logs for the `vault-agent-init` container showed a `403 Permission Denied` when executing the API PUT request to `/v1/auth/kubernetes/login`.
 
+- **Root Cause:** In our Minikube deployment, Vault is configured with an ephemeral, in-memory (`inmem`) storage engine running in development mode (`-dev`). Consequently, when the Vault pod restarted, all runtime configuration—including the enabled Kubernetes authentication engine, policies (`backend-policy`), role bindings (`backend-role`), and stored database secrets—was entirely lost.
+- **Fix:**
+  1. **Re-enabled Kubernetes Auth:** Enabled the auth engine and updated the cluster host details:
+     ```powershell
+     kubectl exec vault-0 -- sh -c "VAULT_TOKEN=root vault auth enable kubernetes"
+     kubectl exec vault-0 -- sh -c 'VAULT_TOKEN=root vault write auth/kubernetes/config kubernetes_host="https://kubernetes.default.svc:443"'
+     ```
+  2. **Re-created Policy & Role:** Created the `backend-policy` (granting read access to PostgreSQL secret path) and created the `backend-role` bound to the `default` service account in the `default` namespace:
+     ```powershell
+     "path `"secret/data/database/config`" { capabilities = [`"read`"] }" | kubectl exec -i vault-0 -- sh -c "VAULT_TOKEN=root vault policy write backend-policy -"
+     kubectl exec vault-0 -- sh -c "VAULT_TOKEN=root vault write auth/kubernetes/role/backend-role bound_service_account_names=default bound_service_account_namespaces=default policies=backend-policy ttl=24h"
+     ```
+  3. **Restored Database Credentials:** Stored PostgreSQL connection credentials inside Vault:
+     ```powershell
+     kubectl exec vault-0 -- sh -c "VAULT_TOKEN=root vault kv put secret/database/config username=myuser password=mysecretpassword"
+     ```
+  4. **Restarted Pods:** Performed a rollout restart on the backend deployment to trigger clean initialization:
+     ```powershell
+     kubectl rollout restart deployment backend-deployment
+     ```
 
+*Result:* The backend deployment successfully rolled out. The new pod transitioned immediately through `PodInitializing` and reached the `Running` (`2/2` Ready) state, with Vault Agent successfully writing retrieved database secrets to the container filesystem.
 
+#### Verification Steps:
+1. **Check Pod Status:**
+   ```powershell
+   kubectl get pods -l app=backend
+   ```
+   **Output:**
+   ```text
+   NAME                                  READY   STATUS    RESTARTS   AGE
+   backend-deployment-6fc6c5c778-p6zch   2/2     Running   0          5s
+   ```
+
+2. **Verify Injected Secret Content:**
+   ```powershell
+   kubectl exec backend-deployment-6fc6c5c778-p6zch -c backend -- cat /vault/secrets/db-creds.properties
+   ```
+   **Output:**
+   ```properties
+   spring.datasource.username=myuser
+   spring.datasource.password=mysecretpassword
+   ```
